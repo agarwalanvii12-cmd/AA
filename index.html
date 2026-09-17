@@ -8,60 +8,88 @@
 <title>Hang It Up - sensor test</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
 <style>
-  html, body { margin:0; padding:0; background:#0e0e12; overflow:hidden; }
+  html, body { margin:0; padding:0; background:#0e0e12; overflow:hidden;
+               font-family: ui-monospace, monospace; }
   canvas { display:block; }
+  #gate {
+    position:fixed; inset:0; background:#0e0e12; z-index:99;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:22px; padding:24px; box-sizing:border-box; text-align:center;
+  }
+  #gate p { color:#8a8a99; font-size:14px; line-height:1.5; margin:0; max-width:320px; }
+  #startBtn {
+    font-family: inherit; font-size:18px; font-weight:600;
+    color:#fff; background:#3c7dff; border:none; border-radius:12px;
+    padding:20px 34px; cursor:pointer; -webkit-appearance:none;
+  }
+  #startBtn:active { background:#2b63d6; }
+  #gateMsg { color:#ff8080; font-size:13px; min-height:18px; max-width:320px; }
 </style>
 </head>
 <body>
+
+<div id="gate">
+  <button id="startBtn">START SENSORS + MIC</button>
+  <p>Allow motion and orientation when iOS asks. Then allow the microphone.</p>
+  <div id="gateMsg"></div>
+</div>
+
 <script>
-// HANG IT UP! - dock sensor smoke test (top-level, no iframe)
+// ---- permission gate: real DOM button, real click event ----
+// iOS only accepts requestPermission() from a click / touchend gesture.
 
-let motionCount = 0, orientCount = 0;
-let motionRate = 0, lastRateCheck = 0, lastMotionCount = 0;
+let started = false, permResult = "", permErr = "";
 
-let ax = 0, ay = 0, az = 0;
-let alpha = 0, beta = 0, gamma = 0;
+const gate = document.getElementById("gate");
+const gateMsg = document.getElementById("gateMsg");
 
-let prevA = null;
-let jitterBuf = [];
-const JITTER_N = 25;
-let jitter = 0;
-let jitterMin = 999, jitterMax = 0;
-
-let source = "none";
-
-let uprightness = 0, flatness = 0;
-let isUpright = false, isStill = false;
-let dockTimer = 0, docked = false;
-
-let thrJitter = 0.08;
-let thrUpright = 0.85;
-const DOCK_MS = 2000;
-
-let analyser = null, micData = null;
-let micReady = false, micErr = "", micLevel = 0, micPeak = 0;
-
-let needsPerm = false, started = false, permErr = "", permResult = "";
-
-let buttons = [];
-let history = [];
-
-function setup() {
-  createCanvas(windowWidth, windowHeight);
-  textFont("monospace");
-  needsPerm =
-    typeof DeviceMotionEvent !== "undefined" &&
-    typeof DeviceMotionEvent.requestPermission === "function";
-  if (!needsPerm) {
-    attachSensors();
-    started = true;
-    permResult = "not required (android/desktop)";
+async function requestAll() {
+  if (typeof DeviceMotionEvent !== "undefined" &&
+      typeof DeviceMotionEvent.requestPermission === "function") {
+    try {
+      const m = await DeviceMotionEvent.requestPermission();
+      permResult = "motion:" + m;
+    } catch (err) {
+      permErr = (err.name || "err") + " / " + (err.message || "");
+      gateMsg.textContent = permErr;
+      return false;
+    }
+    if (typeof DeviceOrientationEvent !== "undefined" &&
+        typeof DeviceOrientationEvent.requestPermission === "function") {
+      try {
+        const o = await DeviceOrientationEvent.requestPermission();
+        permResult += "  orient:" + o;
+      } catch (err) { permResult += "  orient:err"; }
+    }
+  } else {
+    permResult = "no permission needed";
   }
+  return true;
 }
 
-function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+document.getElementById("startBtn").addEventListener("click", async function () {
+  const ok = await requestAll();
+  attachSensors();
+  startMic();
+  started = true;
+  if (ok) gate.style.display = "none";
+  else gateMsg.textContent += "  (tap again)";
+});
+
+// ---- sensors ----
+let motionCount = 0, orientCount = 0;
+let motionRate = 0, lastRateCheck = 0, lastMotionCount = 0;
+let ax = 0, ay = 0, az = 0;
+let alpha = 0, beta = 0, gamma = 0;
+let prevA = null, jitterBuf = [], jitter = 0;
+const JITTER_N = 25;
+let jitterMin = 999, jitterMax = 0;
+let source = "none";
+let attached = false;
 
 function attachSensors() {
+  if (attached) return;
+  attached = true;
   window.addEventListener("devicemotion", onMotion, true);
   window.addEventListener("deviceorientation", onOrient, true);
 }
@@ -85,24 +113,9 @@ function onOrient(e) {
   alpha = e.alpha || 0; beta = e.beta; gamma = e.gamma || 0;
 }
 
-async function startEverything() {
-  if (needsPerm) {
-    try {
-      const m = await DeviceMotionEvent.requestPermission();
-      permResult = "motion: " + m;
-      if (typeof DeviceOrientationEvent !== "undefined" &&
-          typeof DeviceOrientationEvent.requestPermission === "function") {
-        const o = await DeviceOrientationEvent.requestPermission();
-        permResult += "  orient: " + o;
-      }
-    } catch (err) {
-      permErr = (err.name || "failed") + " / " + (err.message || "");
-    }
-  }
-  attachSensors();
-  started = true;
-  startMic();
-}
+// ---- mic ----
+let analyser = null, micData = null;
+let micReady = false, micErr = "", micLevel = 0, micPeak = 0;
 
 async function startMic() {
   try {
@@ -130,6 +143,14 @@ function readMic() {
   micLevel = Math.sqrt(sum / micData.length);
   micPeak = Math.max(micPeak * 0.995, micLevel);
 }
+
+// ---- dock logic ----
+let uprightness = 0, flatness = 0;
+let isUpright = false, isStill = false;
+let dockTimer = 0, docked = false;
+let thrJitter = 0.08, thrUpright = 0.85;
+const DOCK_MS = 2000;
+let history = [], buttons = [];
 
 function updateDerived() {
   if (motionCount > 0) {
@@ -166,42 +187,42 @@ function updateDerived() {
   }
 }
 
+// ---- p5 ----
+function setup() { createCanvas(windowWidth, windowHeight); textFont("monospace"); }
+function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
 function draw() {
   background(14, 14, 18);
   readMic();
   updateDerived();
 
   const M = 16;
-  let y = M + 30;
+  let y = M + 44;
 
-  if (!started) {
-    fill(230); textAlign(CENTER, CENTER); textSize(22);
-    text("TAP THE BUTTON BELOW", width/2, height*0.3);
-    textSize(14); fill(150);
-    text("iOS needs a tap to release the sensors", width/2, height*0.3 + 34);
-  } else {
-    noStroke();
-    fill(docked ? color(60,130,255) : color(50,50,58));
-    rect(M, y, width - M*2, 78, 10);
-    fill(255); textAlign(CENTER, CENTER); textSize(30);
-    text(docked ? "DOCKED" : "NOT DOCKED", width/2, y + 30);
-    textSize(13); fill(docked ? color(220,235,255) : color(150));
-    const prog = Math.min(dockTimer / DOCK_MS, 1);
-    text(docked ? "held for " + (dockTimer/1000).toFixed(1) + "s"
-               : "dock timer " + (prog*100).toFixed(0) + "%", width/2, y + 60);
-  }
+  noStroke();
+  fill(docked ? color(60,130,255) : color(50,50,58));
+  rect(M, y, width - M*2, 78, 10);
+  fill(255); textAlign(CENTER, CENTER); textSize(30);
+  text(docked ? "DOCKED" : "NOT DOCKED", width/2, y + 30);
+  textSize(13); fill(docked ? color(220,235,255) : color(150));
+  const prog = Math.min(dockTimer / DOCK_MS, 1);
+  text(docked ? "held for " + (dockTimer/1000).toFixed(1) + "s"
+             : "dock timer " + (prog*100).toFixed(0) + "%", width/2, y + 60);
   y += 94;
 
   textAlign(LEFT, TOP); textSize(13);
   const alive = motionRate > 0;
   fill(alive ? color(90,220,140) : color(255,90,90));
-  text((alive ? "SENSOR LIVE  " : "NO MOTION DATA  ") + motionRate + " ev/s   src:" + source, M, y);
+  text((alive ? "SENSOR LIVE  " : "NO MOTION DATA  ") + motionRate + " ev/s  src:" + source, M, y);
   y += 20;
   fill(140);
   text("motion:" + motionCount + "  orient:" + orientCount, M, y);
   y += 18;
   if (permResult) { fill(120,200,255); text(permResult, M, y); y += 18; }
-  if (permErr) { fill(255,120,120); text("ERR " + permErr, M, y); y += 18; }
+  if (permErr) {
+    fill(255,120,120);
+    y = wrapText("ERR " + permErr, M, y, width - M*2) + 4;
+  }
 
   y += 6;
   y = row(M, y, "uprightness", uprightness.toFixed(3), isUpright);
@@ -236,21 +257,30 @@ function draw() {
   drawButtons(y);
 }
 
+function wrapText(str, x, y, maxW) {
+  textSize(12);
+  let line = "", yy = y;
+  for (const word of str.split(" ")) {
+    const test = line ? line + " " + word : word;
+    if (textWidth(test) > maxW && line) { text(line, x, yy); yy += 15; line = word; }
+    else line = test;
+  }
+  if (line) { text(line, x, yy); yy += 15; }
+  textSize(13);
+  return yy;
+}
+
 function row(x, y, label, val, ok) {
   noStroke(); fill(130); textSize(13);
   text(label, x, y);
   fill(ok === null ? 225 : ok ? color(90,220,140) : color(235,110,110));
-  textAlign(RIGHT, TOP);
-  text(val, width - x, y);
-  textAlign(LEFT, TOP);
+  textAlign(RIGHT, TOP); text(val, width - x, y); textAlign(LEFT, TOP);
   return y + 21;
 }
 
 function drawButtons(y) {
   buttons = [];
-  const M = 16, w = width - M*2;
-  if (!started) { addBtn(M, y, w, 56, "START SENSORS + MIC", startEverything); return; }
-  const third = (w - 16) / 3;
+  const M = 16, w = width - M*2, third = (w - 16) / 3;
   addBtn(M, y, third, 46, "jitter -", () => (thrJitter = max(0.005, thrJitter - 0.01)));
   addBtn(M + third + 8, y, third, 46, "jitter +", () => (thrJitter += 0.01));
   addBtn(M + (third+8)*2, y, third, 46, "reset",
@@ -261,8 +291,7 @@ function addBtn(x, y, w, h, label, fn) {
   buttons.push({ x, y, w, h, fn });
   noStroke(); fill(38,38,46); rect(x, y, w, h, 8);
   fill(225); textAlign(CENTER, CENTER); textSize(14);
-  text(label, x + w/2, y + h/2);
-  textAlign(LEFT, TOP);
+  text(label, x + w/2, y + h/2); textAlign(LEFT, TOP);
 }
 
 function hit(px, py) {
