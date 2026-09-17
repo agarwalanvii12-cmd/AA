@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Hang It Up - sensor test</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#0e0e12; overflow:hidden; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<script>
+// HANG IT UP! - dock sensor smoke test (top-level, no iframe)
+
+let motionCount = 0, orientCount = 0;
+let motionRate = 0, lastRateCheck = 0, lastMotionCount = 0;
+
+let ax = 0, ay = 0, az = 0;
+let alpha = 0, beta = 0, gamma = 0;
+
+let prevA = null;
+let jitterBuf = [];
+const JITTER_N = 25;
+let jitter = 0;
+let jitterMin = 999, jitterMax = 0;
+
+let source = "none";
+
+let uprightness = 0, flatness = 0;
+let isUpright = false, isStill = false;
+let dockTimer = 0, docked = false;
+
+let thrJitter = 0.08;
+let thrUpright = 0.85;
+const DOCK_MS = 2000;
+
+let analyser = null, micData = null;
+let micReady = false, micErr = "", micLevel = 0, micPeak = 0;
+
+let needsPerm = false, started = false, permErr = "", permResult = "";
+
+let buttons = [];
+let history = [];
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  textFont("monospace");
+  needsPerm =
+    typeof DeviceMotionEvent !== "undefined" &&
+    typeof DeviceMotionEvent.requestPermission === "function";
+  if (!needsPerm) {
+    attachSensors();
+    started = true;
+    permResult = "not required (android/desktop)";
+  }
+}
+
+function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+function attachSensors() {
+  window.addEventListener("devicemotion", onMotion, true);
+  window.addEventListener("deviceorientation", onOrient, true);
+}
+
+function onMotion(e) {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x === null || a.x === undefined) return;
+  motionCount++;
+  ax = a.x; ay = a.y; az = a.z;
+  if (prevA) {
+    const d = Math.sqrt((ax-prevA.x)**2 + (ay-prevA.y)**2 + (az-prevA.z)**2);
+    jitterBuf.push(d);
+    if (jitterBuf.length > JITTER_N) jitterBuf.shift();
+  }
+  prevA = { x: ax, y: ay, z: az };
+}
+
+function onOrient(e) {
+  if (e.beta === null || e.beta === undefined) return;
+  orientCount++;
+  alpha = e.alpha || 0; beta = e.beta; gamma = e.gamma || 0;
+}
+
+async function startEverything() {
+  if (needsPerm) {
+    try {
+      const m = await DeviceMotionEvent.requestPermission();
+      permResult = "motion: " + m;
+      if (typeof DeviceOrientationEvent !== "undefined" &&
+          typeof DeviceOrientationEvent.requestPermission === "function") {
+        const o = await DeviceOrientationEvent.requestPermission();
+        permResult += "  orient: " + o;
+      }
+    } catch (err) {
+      permErr = (err.name || "failed") + " / " + (err.message || "");
+    }
+  }
+  attachSensors();
+  started = true;
+  startMic();
+}
+
+async function startMic() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    await ctx.resume();
+    const src = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    micData = new Uint8Array(analyser.fftSize);
+    micReady = true;
+  } catch (err) { micErr = err.name || "mic failed"; }
+}
+
+function readMic() {
+  if (!micReady) return;
+  analyser.getByteTimeDomainData(micData);
+  let sum = 0;
+  for (let i = 0; i < micData.length; i++) {
+    const v = (micData[i] - 128) / 128;
+    sum += v * v;
+  }
+  micLevel = Math.sqrt(sum / micData.length);
+  micPeak = Math.max(micPeak * 0.995, micLevel);
+}
+
+function updateDerived() {
+  if (motionCount > 0) {
+    source = "motion";
+    const mag = Math.sqrt(ax*ax + ay*ay + az*az) || 1;
+    uprightness = Math.abs(ay) / mag;
+    flatness = Math.abs(az) / mag;
+    jitter = jitterBuf.length ? jitterBuf.reduce((s,v)=>s+v,0)/jitterBuf.length : 0;
+  } else if (orientCount > 0) {
+    source = "orientation";
+    uprightness = Math.max(0, Math.cos(radians(90 - beta)));
+    flatness = 1 - uprightness;
+    jitter = 0;
+  } else { source = "none"; }
+
+  if (started && source === "motion") {
+    jitterMin = Math.min(jitterMin, jitter);
+    jitterMax = Math.max(jitterMax, jitter);
+  }
+
+  isUpright = uprightness > thrUpright && flatness < 0.45;
+  isStill = source === "motion" ? jitter < thrJitter : true;
+
+  if (isUpright && isStill) dockTimer += deltaTime; else dockTimer = 0;
+  docked = dockTimer >= DOCK_MS;
+
+  history.push(jitter);
+  if (history.length > 180) history.shift();
+
+  if (millis() - lastRateCheck > 1000) {
+    motionRate = motionCount - lastMotionCount;
+    lastMotionCount = motionCount;
+    lastRateCheck = millis();
+  }
+}
+
+function draw() {
+  background(14, 14, 18);
+  readMic();
+  updateDerived();
+
+  const M = 16;
+  let y = M + 30;
+
+  if (!started) {
+    fill(230); textAlign(CENTER, CENTER); textSize(22);
+    text("TAP THE BUTTON BELOW", width/2, height*0.3);
+    textSize(14); fill(150);
+    text("iOS needs a tap to release the sensors", width/2, height*0.3 + 34);
+  } else {
+    noStroke();
+    fill(docked ? color(60,130,255) : color(50,50,58));
+    rect(M, y, width - M*2, 78, 10);
+    fill(255); textAlign(CENTER, CENTER); textSize(30);
+    text(docked ? "DOCKED" : "NOT DOCKED", width/2, y + 30);
+    textSize(13); fill(docked ? color(220,235,255) : color(150));
+    const prog = Math.min(dockTimer / DOCK_MS, 1);
+    text(docked ? "held for " + (dockTimer/1000).toFixed(1) + "s"
+               : "dock timer " + (prog*100).toFixed(0) + "%", width/2, y + 60);
+  }
+  y += 94;
+
+  textAlign(LEFT, TOP); textSize(13);
+  const alive = motionRate > 0;
+  fill(alive ? color(90,220,140) : color(255,90,90));
+  text((alive ? "SENSOR LIVE  " : "NO MOTION DATA  ") + motionRate + " ev/s   src:" + source, M, y);
+  y += 20;
+  fill(140);
+  text("motion:" + motionCount + "  orient:" + orientCount, M, y);
+  y += 18;
+  if (permResult) { fill(120,200,255); text(permResult, M, y); y += 18; }
+  if (permErr) { fill(255,120,120); text("ERR " + permErr, M, y); y += 18; }
+
+  y += 6;
+  y = row(M, y, "uprightness", uprightness.toFixed(3), isUpright);
+  y = row(M, y, "flatness", flatness.toFixed(3), null);
+  y = row(M, y, "jitter", jitter.toFixed(4), isStill);
+  y = row(M, y, "jitter min/max",
+    (jitterMin === 999 ? "-" : jitterMin.toFixed(4)) + " / " + jitterMax.toFixed(4), null);
+  y = row(M, y, "accel x/y/z",
+    ax.toFixed(1) + " " + ay.toFixed(1) + " " + az.toFixed(1), null);
+  y = row(M, y, "beta/gamma", beta.toFixed(0) + " / " + gamma.toFixed(0), null);
+  y = row(M, y, "mic level",
+    micReady ? micLevel.toFixed(4) + "  pk " + micPeak.toFixed(3)
+             : (micErr ? "ERR " + micErr : "off"), micReady);
+
+  y += 10;
+  const gh = 70;
+  noFill(); stroke(45); rect(M, y, width - M*2, gh);
+  stroke(255,180,60);
+  const ty = y + gh - constrain(thrJitter/0.6, 0, 1) * gh;
+  line(M, ty, width - M, ty);
+  stroke(120,200,255); noFill();
+  beginShape();
+  for (let i = 0; i < history.length; i++) {
+    vertex(map(i, 0, 180, M, width - M),
+           y + gh - constrain(history[i]/0.6, 0, 1) * gh);
+  }
+  endShape();
+  noStroke(); fill(255,180,60); textSize(11);
+  text("threshold " + thrJitter.toFixed(3), M + 4, y + 4);
+  y += gh + 14;
+
+  drawButtons(y);
+}
+
+function row(x, y, label, val, ok) {
+  noStroke(); fill(130); textSize(13);
+  text(label, x, y);
+  fill(ok === null ? 225 : ok ? color(90,220,140) : color(235,110,110));
+  textAlign(RIGHT, TOP);
+  text(val, width - x, y);
+  textAlign(LEFT, TOP);
+  return y + 21;
+}
+
+function drawButtons(y) {
+  buttons = [];
+  const M = 16, w = width - M*2;
+  if (!started) { addBtn(M, y, w, 56, "START SENSORS + MIC", startEverything); return; }
+  const third = (w - 16) / 3;
+  addBtn(M, y, third, 46, "jitter -", () => (thrJitter = max(0.005, thrJitter - 0.01)));
+  addBtn(M + third + 8, y, third, 46, "jitter +", () => (thrJitter += 0.01));
+  addBtn(M + (third+8)*2, y, third, 46, "reset",
+    () => { jitterMin = 999; jitterMax = 0; micPeak = 0; });
+}
+
+function addBtn(x, y, w, h, label, fn) {
+  buttons.push({ x, y, w, h, fn });
+  noStroke(); fill(38,38,46); rect(x, y, w, h, 8);
+  fill(225); textAlign(CENTER, CENTER); textSize(14);
+  text(label, x + w/2, y + h/2);
+  textAlign(LEFT, TOP);
+}
+
+function hit(px, py) {
+  for (const b of buttons) {
+    if (px > b.x && px < b.x + b.w && py > b.y && py < b.y + b.h) { b.fn(); return true; }
+  }
+  return false;
+}
+
+function touchStarted() {
+  if (touches.length) hit(touches[0].x, touches[0].y); else hit(mouseX, mouseY);
+  return false;
+}
+function mousePressed() { hit(mouseX, mouseY); return false; }
+</script>
+</body>
+</html>
